@@ -30,8 +30,6 @@
 
 ARG BASE_IMAGE=nvcr.io/nvidia/tritonserver:20.08-py3
 ARG PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:20.08-py3
-ARG TENSORFLOW1_IMAGE=nvcr.io/nvidia/tensorflow:20.08-tf1-py3
-ARG TENSORFLOW2_IMAGE=nvcr.io/nvidia/tensorflow:20.08-tf2-py3
 
 ############################################################################
 ## PyTorch stage: Use PyTorch container for Caffe2 and libtorch
@@ -136,7 +134,7 @@ RUN python3 /workspace/onnxruntime/tools/ci_build/build.py --build_dir /workspac
 RUN echo "import onnx; print(onnx.__version__)" | python3 > /workspace/ort_onnx_version.txt
 
 ############################################################################
-## Build stage: Build inference server
+## Final stage: Install and arrange all dependencies needed for build
 ############################################################################
 FROM ${BASE_IMAGE} AS tritonserver_build
 
@@ -152,6 +150,7 @@ RUN apt-get update && \
             autoconf \
             automake \
             build-essential \
+            docker.io \
             git \
             libgoogle-glog0v5 \
             libre2-dev \
@@ -164,18 +163,9 @@ RUN apt-get update && \
             python3-dev \
             python3-pip \
             python3-setuptools \
-            software-properties-common && \
-    if [ $(cat /etc/os-release | grep 'VERSION_ID="16.04"' | wc -l) -ne 0 ]; then \
-        apt-get install -y --no-install-recommends \
-                libcurl3-dev; \
-    elif [ $(cat /etc/os-release | grep 'VERSION_ID="18.04"' | wc -l) -ne 0 ]; then \
-        apt-get install -y --no-install-recommends \
-                libcurl4-openssl-dev \
-                zlib1g-dev; \
-    else \
-        echo "Ubuntu version must be either 16.04 or 18.04" && \
-        exit 1; \
-    fi && \
+            software-properties-common \
+            libcurl4-openssl-dev \
+            zlib1g-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Install dependencies for protobuf code generation in Python
@@ -274,181 +264,9 @@ RUN cd /opt/tritonserver/backends/onnxruntime && \
         patchelf --set-rpath '$ORIGIN' $i; \
     done
 
-# Copy entire repo into container even though some is not needed for
-# build itself... because we want to be able to copyright check on
-# files that aren't directly needed for build.
 WORKDIR /workspace
 RUN rm -fr *
-COPY . .
-
-# Copy ONNX custom op library and model (Needed for testing)
-COPY --from=tritonserver_onnx /workspace/build/Release/libcustom_op_library.so \
-    /workspace/qa/L0_custom_ops/
-COPY --from=tritonserver_onnx /workspace/build/Release/testdata/custom_op_library/custom_op_test.onnx \
-    /workspace/qa/L0_custom_ops/
-
-# Build the server.
-#
-# - Need to find CUDA stubs if they are available since some backends
-# may need to link against them. This is identical to the logic in TF
-# container nvbuild.sh
-ARG TRITON_COMMON_REPO_TAG=main
-ARG TRITON_CORE_REPO_TAG=main
-ARG TRITON_BACKEND_REPO_TAG=main
-
-RUN LIBCUDA_FOUND=$(ldconfig -p | grep -v compat | awk '{print $1}' | grep libcuda.so | wc -l) && \
-    if [[ "$LIBCUDA_FOUND" -eq 0 ]]; then \
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64/stubs; \
-        ln -fs /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1; \
-    fi && \
-    rm -fr builddir && mkdir -p builddir && \
-    (cd builddir && \
-            cmake -DCMAKE_BUILD_TYPE=Release \
-                  -DTRITON_COMMON_REPO_TAG=${TRITON_COMMON_REPO_TAG} \
-                  -DTRITON_CORE_REPO_TAG=${TRITON_CORE_REPO_TAG} \
-                  -DTRITON_BACKEND_REPO_TAG=${TRITON_BACKEND_REPO_TAG} \
-                  -DTRITON_ENABLE_GRPC=ON \
-                  -DTRITON_ENABLE_HTTP=ON \
-                  -DTRITON_ENABLE_METRICS=ON \
-                  -DTRITON_ENABLE_METRICS_GPU=ON \
-                  -DTRITON_ENABLE_STATS=ON \
-                  -DTRITON_ENABLE_TRACING=ON \
-                  -DTRITON_ENABLE_GCS=ON \
-                  -DTRITON_ENABLE_S3=ON \
-                  -DTRITON_ENABLE_CUSTOM=ON \
-                  -DTRITON_ENABLE_TENSORFLOW=ON \
-                  -DTRITON_ENABLE_TENSORRT=ON \
-                  -DTRITON_ENABLE_CAFFE2=ON \
-                  -DTRITON_ENABLE_ONNXRUNTIME=ON \
-                  -DTRITON_ENABLE_ONNXRUNTIME_TENSORRT=ON \
-                  -DTRITON_ENABLE_ONNXRUNTIME_OPENVINO=ON \
-                  -DTRITON_ENABLE_PYTORCH=ON \
-                  -DTRITON_ENABLE_ENSEMBLE=ON \
-                  -DTRITON_ONNXRUNTIME_INCLUDE_PATHS="/opt/tritonserver/include/onnxruntime" \
-                  -DTRITON_PYTORCH_INCLUDE_PATHS="/opt/tritonserver/include/torch;/opt/tritonserver/include/torch/torch/csrc/api/include;/opt/tritonserver/include/torchvision;/usr/include/python3.6" \
-                  -DTRITON_EXTRA_LIB_PATHS="/opt/tritonserver/lib;/opt/tritonserver/lib/pytorch" \
-                  ../build && \
-            make -j16 server && \
-            mkdir -p /opt/tritonserver/include && \
-            cp -r server/install/bin /opt/tritonserver/. && \
-            cp -r server/install/lib /opt/tritonserver/. && \
-            cp -r server/install/include/triton /opt/tritonserver/include/.) && \
-    (cd /opt/tritonserver && ln -sf /workspace/qa qa)
-
-# Build the backends.
-#
-RUN ./build.py -v \
-    --version=${TRITON_VERSION} --container-version=${TRITON_CONTAINER_VERSION} \
-    --build-dir=/workspace/backendbuild \
-    --install-dir=/opt/tritonserver \
-    --backend=identity:main \
-    --backend=repeat:main \
-    --backend=square:main \
-    --backend=onnxruntime:main \
-    --backend=tensorflow1:davidg-build \
-    --backend=tensorflow2:davidg-build \
-    --backend=python:main
+COPY build.py build.py
 
 ENV TRITON_SERVER_VERSION ${TRITON_VERSION}
 ENV NVIDIA_TRITON_SERVER_VERSION ${TRITON_CONTAINER_VERSION}
-ENV TRITON_SERVER_VERSION ${TRITON_VERSION}
-ENV NVIDIA_TRITON_SERVER_VERSION ${TRITON_CONTAINER_VERSION}
-ENV PATH /opt/tritonserver/bin:${PATH}
-
-COPY nvidia_entrypoint.sh /opt/tritonserver
-ENTRYPOINT ["/opt/tritonserver/nvidia_entrypoint.sh"]
-
-############################################################################
-##  Production stage: Create container with just inference server executable
-############################################################################
-FROM ${BASE_IMAGE}
-
-ARG TRITON_VERSION=2.4.0dev
-ARG TRITON_CONTAINER_VERSION=20.10dev
-
-ENV TRITON_SERVER_VERSION ${TRITON_VERSION}
-ENV NVIDIA_TRITON_SERVER_VERSION ${TRITON_CONTAINER_VERSION}
-ENV TRITON_SERVER_VERSION ${TRITON_VERSION}
-ENV NVIDIA_TRITON_SERVER_VERSION ${TRITON_CONTAINER_VERSION}
-LABEL com.nvidia.tritonserver.version="${TRITON_SERVER_VERSION}"
-
-ENV PATH /opt/tritonserver/bin:${PATH}
-
-# Need to include pytorch in LD_LIBRARY_PATH since Torchvision loads custom
-# ops from that path
-ENV LD_LIBRARY_PATH /opt/tritonserver/lib/pytorch/:$LD_LIBRARY_PATH
-
-ENV TF_ADJUST_HUE_FUSED         1
-ENV TF_ADJUST_SATURATION_FUSED  1
-ENV TF_ENABLE_WINOGRAD_NONFUSED 1
-ENV TF_AUTOTUNE_THRESHOLD       2
-
-# Needed by Caffe2 libraries to avoid:
-# Intel MKL FATAL ERROR: Cannot load libmkl_intel_thread.so
-ENV MKL_THREADING_LAYER GNU
-
-# Create a user that can be used to run the triton-server as
-# non-root. Make sure that this user to given ID 1000. All server
-# artifacts copied below are assign to this user.
-ENV TRITON_SERVER_USER=triton-server
-RUN userdel tensorrt-server > /dev/null 2>&1 || true && \
-    if ! id -u $TRITON_SERVER_USER > /dev/null 2>&1 ; then \
-        useradd $TRITON_SERVER_USER; \
-    fi && \
-    [ `id -u $TRITON_SERVER_USER` -eq 1000 ] && \
-    [ `id -g $TRITON_SERVER_USER` -eq 1000 ]
-
-# libgoogle-glog0v5 is needed by caffe2 libraries.
-# libcurl is needed for GCS
-RUN apt-get update && \
-    if [ $(cat /etc/os-release | grep 'VERSION_ID="16.04"' | wc -l) -ne 0 ]; then \
-        apt-get install -y --no-install-recommends \
-                libb64-0d \
-                libcurl3-dev \
-                libgoogle-glog0v5 \
-                libre2-1v5; \
-    elif [ $(cat /etc/os-release | grep 'VERSION_ID="18.04"' | wc -l) -ne 0 ]; then \
-        apt-get install -y --no-install-recommends \
-                libb64-0d \
-                libcurl4-openssl-dev \
-                libgoogle-glog0v5 \
-                libre2-4; \
-    else \
-        echo "Ubuntu version must be either 16.04 or 18.04" && \
-        exit 1; \
-    fi && \
-    rm -rf /var/lib/apt/lists/*
-
-ARG OPENVINO_VERSION=2020.2
-WORKDIR /opt/tritonserver
-RUN rm -fr /opt/tritonserver/*
-COPY --chown=1000:1000 LICENSE .
-COPY --chown=1000:1000 --from=tritonserver_onnx /data/dldt/openvino_${OPENVINO_VERSION}/LICENSE LICENSE.openvino
-COPY --chown=1000:1000 --from=tritonserver_onnx /workspace/onnxruntime/LICENSE LICENSE.onnxruntime
-COPY --chown=1000:1000 --from=tritonserver_pytorch /opt/pytorch/pytorch/LICENSE LICENSE.pytorch
-COPY --chown=1000:1000 --from=tritonserver_build /opt/tritonserver/bin/tritonserver bin/
-COPY --chown=1000:1000 --from=tritonserver_build /opt/tritonserver/lib lib
-COPY --chown=1000:1000 --from=tritonserver_build /opt/tritonserver/backends backends
-
-# Get ONNX version supported
-COPY --chown=1000:1000 --from=tritonserver_onnx /workspace/ort_onnx_version.txt ort_onnx_version.txt
-RUN export ONNX_VERSION=`cat ort_onnx_version.txt` && rm -f ort_onnx_version.txt
-
-# Perf test provided by ONNX Runtime, can be used to test run model with ONNX Runtime directly
-COPY --chown=1000:1000 --from=tritonserver_onnx /workspace/build/Release/onnxruntime_perf_test /opt/onnxruntime/
-
-# Extra defensive wiring for CUDA Compat lib
-RUN ln -sf ${_CUDA_COMPAT_PATH}/lib.real ${_CUDA_COMPAT_PATH}/lib \
- && echo ${_CUDA_COMPAT_PATH}/lib > /etc/ld.so.conf.d/00-cuda-compat.conf \
- && ldconfig \
- && rm -f ${_CUDA_COMPAT_PATH}/lib
-
-COPY --chown=1000:1000 nvidia_entrypoint.sh /opt/tritonserver
-ENTRYPOINT ["/opt/tritonserver/nvidia_entrypoint.sh"]
-
-ARG NVIDIA_BUILD_ID
-ENV NVIDIA_BUILD_ID ${NVIDIA_BUILD_ID:-<unknown>}
-LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
-ARG NVIDIA_BUILD_REF
-LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
-
