@@ -69,9 +69,11 @@ def rmdir(path):
     log_verbose('rmdir: {}'.format(path))
     shutil.rmtree(path, ignore_errors=True)
 
+
 def cpdir(src, dest):
     log_verbose('cpdir: {} -> {}'.format(src, dest))
     copy_tree(src, dest, preserve_symlinks=1)
+
 
 def gitclone(cwd, repo, tag):
     log_verbose('git clone of repo "{}" at tag "{}"'.format(repo, tag))
@@ -154,19 +156,56 @@ def onnxruntime_cmake_args():
 
 def tensorflow_cmake_args(ver):
     image = 'nvcr.io/nvidia/tensorflow:{}-tf{}-py3'.format(
-        FLAGS.container_version, ver)
+        FLAGS.upstream_container_version, ver)
     return [
         '-DTRITON_TENSORFLOW_VERSION={}'.format(ver),
         '-DTRITON_TENSORFLOW_DOCKER_IMAGE={}'.format(image)
     ]
+
 
 def dali_cmake_args():
     return [
         '-DTRITON_DALI_SKIP_DOWNLOAD=OFF',
     ]
 
+
+def container_build(container_version):
+    log('Create build container')
+
+    # Set the docker build-args based on 'container_version'
+    if container_version == '20.08':
+        onnx_runtime_version = '1.4.0'
+        onnx_runtime_openvino_version = '2020.2'
+    else:
+        fail('unsupported container version {}'.format(container_version))
+
+    args = ['docker', 'build', '--pull']
+#    for f in FLAGS.build_container_tag:
+#        args += [ '-t', f ]
+
+    args += [
+        '--target', 'tritonserver_build', '-f', 'Dockerfile.build',
+        '--build-arg', 'TRITON_VERSION={}'.format(FLAGS.version),
+                 '--build-arg', 'TRITON_CONTAINER_VERSION={}'.format(container_version),
+                 '--build-arg', 'BASE_IMAGE=nvcr.io/nvidia/tritonserver:{}-py3'.format(container_version),
+                 '--build-arg', 'PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:{}-py3'.format(container_version),
+                 '--build-arg', 'ONNX_RUNTIME_VERSION={}'.format(onnx_runtime_version),
+                 '--build-arg', 'ONNX_RUNTIME_OPENVINO_VERSION={}'.format(onnx_runtime_openvino_version), '.']
+
+    log_verbose('container build {}'.format(args))
+    p = subprocess.Popen(args, shell=True)
+    p.wait()
+    fail_if(p.returncode != 0, 'container build failed')
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+
+    # Used internally for docker build, not intended for direct use
+    parser.add_argument('--upstream-container-version',
+                        type=str,
+                        required=False,
+                        help=argparse.SUPPRESS)
+
     parser.add_argument('-v',
                         '--verbose',
                         action="store_true",
@@ -200,13 +239,18 @@ if __name__ == '__main__':
         help='Build parallelism. Defaults to 2 * number-of-cores.')
 
     parser.add_argument('--version',
-                        type=str,
-                        required=True,
-                        help='The Triton version.')
-    parser.add_argument('--container-version',
-                        type=str,
-                        required=True,
-                        help='The Triton container version.')
+                               type=str,
+        required=False,
+        default='0.0.0',
+                               help='The Triton version.')
+    parser.add_argument(
+        '--container-version',
+        type=str,
+        required=False,
+        help=
+        'The Triton container version. If specified, Docker will be used for the build and component versions will be set automatically.'
+    )
+
     parser.add_argument('--disable-gpu',
                         action="store_true",
                         required=False,
@@ -231,12 +275,21 @@ if __name__ == '__main__':
 
     FLAGS = parser.parse_args()
 
+    # If --container-version is specified then we use Dockerfile.build
+    # to create the appropriate base build container and then perform
+    # the actual build within that container.
+    if FLAGS.container_version is not None:
+        container_build(FLAGS.container_version)
+        sys.exit(0)
+
     log('Building Triton Inference Server')
 
     if FLAGS.install_dir is None:
         FLAGS.install_dir = os.path.join(FLAGS.build_dir, "opt", "tritonserver")
     if FLAGS.build_parallel is None:
         FLAGS.build_parallel = multiprocessing.cpu_count() * 2
+    if FLAGS.version is None:
+        FLAGS.version = '0.0.0'
 
     # Initialize map of common components and repo-tag for each.
     components = {'common': 'main', 'core': 'main', 'backend': 'main'}
@@ -281,4 +334,4 @@ if __name__ == '__main__':
         rmdir(backend_install_dir)
         mkdir(backend_install_dir)
         cpdir(os.path.join(repo_install_dir, 'backends', be),
-                  backend_install_dir)
+              backend_install_dir)
