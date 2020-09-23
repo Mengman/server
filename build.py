@@ -26,12 +26,15 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import argparse
+import logging
+import docker
 import os.path
 import multiprocessing
 import pathlib
 import shutil
 import subprocess
 import sys
+import traceback
 from distutils.dir_util import copy_tree
 
 #
@@ -179,23 +182,113 @@ def container_build(container_version):
     else:
         fail('unsupported container version {}'.format(container_version))
 
-    args = ['docker', 'build', '--pull']
-#    for f in FLAGS.build_container_tag:
-#        args += [ '-t', f ]
+    client = docker.from_env()
 
-    args += [
-        '--target', 'tritonserver_build', '-f', 'Dockerfile.build',
-        '--build-arg', 'TRITON_VERSION={}'.format(FLAGS.version),
-                 '--build-arg', 'TRITON_CONTAINER_VERSION={}'.format(container_version),
-                 '--build-arg', 'BASE_IMAGE=nvcr.io/nvidia/tritonserver:{}-py3'.format(container_version),
-                 '--build-arg', 'PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:{}-py3'.format(container_version),
-                 '--build-arg', 'ONNX_RUNTIME_VERSION={}'.format(onnx_runtime_version),
-                 '--build-arg', 'ONNX_RUNTIME_OPENVINO_VERSION={}'.format(onnx_runtime_openvino_version), '.']
+    buildargs = {
+        'TRITON_VERSION':
+            FLAGS.version,
+        'TRITON_CONTAINER_VERSION':
+            container_version,
+        'BASE_IMAGE':
+            'nvcr.io/nvidia/tritonserver:{}-py3'.format(container_version),
+        'PYTORCH_IMAGE':
+            'nvcr.io/nvidia/pytorch:{}-py3'.format(container_version),
+        'ONNX_RUNTIME_VERSION':
+            onnx_runtime_version,
+        'ONNX_RUNTIME_OPENVINO_VERSION':
+            onnx_runtime_openvino_version
+    }
 
-    log_verbose('container build {}'.format(args))
-    p = subprocess.Popen(args, shell=True)
-    p.wait()
-    fail_if(p.returncode != 0, 'container build failed')
+    log_verbose('container build {}'.format(buildargs))
+    try:
+        # First build Dockerfile.build. Because of the way Docker does
+        # caching with multi-stage images, we must build each stage
+        # separately to make sure it is cached (specifically this is
+        # needed for CI builds where the build starts with a clean
+        # docker cache each time).
+
+        # PyTorch
+        image, output = client.images.build(path='.',
+                                            rm=True,
+                                            quiet=False,
+                                            pull=True,
+                                            tag='tritonserver_pytorch',
+                                            dockerfile='Dockerfile.build',
+                                            target='tritonserver_pytorch',
+                                            cache_from=[
+                                                'tritonserver_pytorch_cache0',
+                                                'tritonserver_pytorch_cache1'
+                                            ],
+                                            buildargs=buildargs)
+        if FLAGS.verbose:
+            for ln in output:
+                log_verbose(ln)
+
+        # ONNX Runtime
+        image, output = client.images.build(path='.',
+                                            rm=True,
+                                            quiet=False,
+                                            pull=True,
+                                            tag='tritonserver_onnx',
+                                            dockerfile='Dockerfile.build',
+                                            target='tritonserver_onnx',
+                                            cache_from=[
+                                                'tritonserver_pytorch_cache0',
+                                                'tritonserver_pytorch_cache1'
+                                                'tritonserver_onnx_cache0',
+                                                'tritonserver_onnx_cache1'
+                                            ],
+                                            buildargs=buildargs)
+        if FLAGS.verbose:
+            for ln in output:
+                log_verbose(ln)
+
+        # Final build image
+        image, output = client.images.build(path='.',
+                                            rm=True,
+                                            quiet=False,
+                                            pull=True,
+                                            tag='tritonserver_build',
+                                            dockerfile='Dockerfile.build',
+                                            cache_from=[
+                                                'tritonserver_pytorch_cache0',
+                                                'tritonserver_pytorch_cache1'
+                                                'tritonserver_onnx_cache0',
+                                                'tritonserver_onnx_cache1'
+                                                'tritonserver_build_cache0',
+                                                'tritonserver_build_cache1'
+                                            ],
+                                            buildargs=buildargs)
+        if FLAGS.verbose:
+            for ln in output:
+                log_verbose(ln)
+
+        # Next run build.py inside the container with the same flags
+        # as was used to run this instance, except with
+        # --container-version changes to --upstream-container-version.
+        runargs = [
+            a.replace('--container-version', '--upstream-container-version')
+            for a in sys.argv
+        ]
+        container = client.containers.run(
+            image,
+            'build.py {}'.format(runargs.join(' ')),
+            detach=True,
+            name='tritonserver_builder0',
+            volumes={
+                '/var/run/docker.sock': {
+                    'bind': '/var/run/docker.sock',
+                    'mode': 'rw'
+                }
+            })
+        if FLAGS.verbose:
+            for ln in container.logs(stream=True):
+                log_verbose(ln)
+
+    except Exception as e:
+        logging.error(traceback.format_exc())
+        fail('container build failed')
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -239,10 +332,10 @@ if __name__ == '__main__':
         help='Build parallelism. Defaults to 2 * number-of-cores.')
 
     parser.add_argument('--version',
-                               type=str,
-        required=False,
-        default='0.0.0',
-                               help='The Triton version.')
+                        type=str,
+                        required=False,
+                        default='0.0.0',
+                        help='The Triton version.')
     parser.add_argument(
         '--container-version',
         type=str,
