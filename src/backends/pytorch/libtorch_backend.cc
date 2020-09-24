@@ -758,6 +758,7 @@ LibTorchBackend::Context::Execute(
     std::vector<torch::jit::IValue>* inputs_,
     std::vector<torch::Tensor>* outputs_)
 {
+  torch::NoGradGuard no_grad;
   torch::jit::IValue model_outputs_;
 
   try {
