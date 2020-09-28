@@ -61,5 +61,5 @@ if(${TRITON_ENABLE_METRICS})
   )
 endif() # TRITON_ENABLE_METRICS
 
-add_subdirectory(examples src/backends/backend/examples)
-add_subdirectory(tensorflow src/backends/backend/tensorflow)
+# add_subdirectory(examples src/backends/backend/examples)
+# add_subdirectory(tensorflow src/backends/backend/tensorflow)
