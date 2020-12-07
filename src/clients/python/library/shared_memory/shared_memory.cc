@@ -130,8 +130,9 @@ GetSharedMemoryHandleInfo(
 int
 SharedMemoryRegionDestroy(void* shm_handle)
 {
-  std::string shm_key =
-      reinterpret_cast<SharedMemoryHandle*>(shm_handle)->shm_key_;
+  auto handle = reinterpret_cast<SharedMemoryHandle*>(shm_handle);
+  std::string shm_key = handle->shm_key_;
+  munmap(handle->base_addr_, handle->byte_size_);
   int shm_fd = shm_unlink(shm_key.c_str());
   if (shm_fd == -1) {
     return -5;
